@@ -1,0 +1,7 @@
+test_v2
+train_v2
+test_v1
+train_v1
+logs
+sample_submission_v2.csv
+__pycache__
