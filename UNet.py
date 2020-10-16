@@ -4,80 +4,74 @@ import numpy as np
 import os
 import matplotlib.pyplot as plt
 import pandas as pd
-from cv2 import waitKey,imread,resize
-#from skimage.transform import resize
-from skimage.io import imshow
-from skimage import img_as_bool
-from skimage.transform import resize as skresize
 from tqdm import tqdm 
-from tensorflow.keras.layers import Input,Conv2D,Dropout,MaxPooling2D,concatenate,Conv2DTranspose
+from tensorflow.keras.layers import Input,Conv2D,MaxPooling2D,concatenate,Conv2DTranspose
 from runLengthEncodeDecode import rle_decode,rle_encode,masks_as_image
 from tensorflow.keras.callbacks import ModelCheckpoint,EarlyStopping,TensorBoard
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
 
-%matplotlib inline
+#%matplotlib inline
 
-#%% Build Training Data
+#%% Work Constants
 # Work paths
-TRAIN_PATH = 'train_v2/'
-TEST_PATH = 'test_v2/'
-MASK_PATH = 'train_ship_segmentations_v2.csv'
+TRAIN_PATH = '../data/train_v2/'
+TEST_PATH = '../data/test_v2/'
+DF_NAME = 'train_ship_segmentations_v2.csv'
+CHECKPOINT_PATH = 'Unet_model_weights.h5'
 
-# Define input diemsnions
+# Training Variables
 [W, H, C] = [768, 768, 3]
+TRAIN_BATCH = 32
+TEST_BATCH = 1
+EPOCHS = 1
 
-# Retrieve data
-train_ids = next(os.walk(TRAIN_PATH))[2]
-test_ids = next(os.walk(TEST_PATH))[2]
+# Calulate iterations needed per epoch given a batch size
+STEP_SIZE_TRAIN = len([f for f in os.listdir(TRAIN_PATH)]) // TRAIN_BATCH
+STEP_SIZE_TEST = len([f for f in os.listdir(TEST_PATH + 'ships/')]) // TEST_BATCH
 
-X_test = np.zeros((len(test_ids), W, H, C), dtype=np.uint8)
-
-X_train = np.zeros((len(train_ids), W, H, C), dtype=np.uint8)
-Y_train = np.zeros((len(train_ids), W, H, 1), dtype=np.bool)
-
-# Load masks data
-mask_df = pd.read_csv(MASK_PATH)
-
-# Load training data
-for n, img_id in tqdm(enumerate(train_ids), total=len(train_ids)):
-    # Load images
-    img = imread(TRAIN_PATH + img_id)
-    [mask_h, mask_w, _] = np.shape(img)
-    #img = resize(img, (H, W))
-    X_train[n] = img
+#%% Mask RLE conversion generator function
+def decodeGenerator(generator, shape):
+    '''
+    generator function that calls for the train_generator
+    modify the y output by decoding the elements
+    return x and y
+    '''
+    while True:
+        [x_out, y] = next(generator)
     
-    # Load masks
-    mask = mask_df.EncodedPixels[mask_df.ImageId==img_id].to_list()
-    if str(mask[0]) == 'nan':
-        mask = np.zeros((W,H,1), dtype=bool)
-    else:
-        mask = rle_decode(str(mask[0]), (mask_h, mask_w))
-        #mask = skresize(mask, (H,W))
-        mask = np.expand_dims(mask, -1)
-    Y_train[n] = mask
-
-# Load testing data
-for n, img_id in tqdm(enumerate(test_ids), total=len(test_ids)):
-    # Load images
-    img = imread(TEST_PATH + img_id)
-    [mask_h, mask_w, _] = np.shape(img)
-    #img = resize(img, (H, W))
-    X_test[n] = img
-
-
+        # Initialize y_out
+        y_out = np.zeros(shape, dtype=np.bool)
+        
+        # Cycle through masks in y
+        for i, mask in enumerate(y):
+            # Check whether it is a NaN
+            if str(mask) != 'nan':
+                #Decode the mask
+                y_out[i] = rle_decode(str(mask), shape[1:3])
     
-#%% Plot
-image_x = 29
-[fig, (ax1, ax2)] = plt.subplots(1,2, figsize = (10,5))
-ax1.imshow(X_train[image_x])
-ax2.imshow(np.squeeze(Y_train[image_x]))
+        yield x_out, y_out
+
+
+#%% Load Training Data
+df = pd.read_csv(DF_NAME)
+
+print('Loading Data....\n')
+datagen = ImageDataGenerator(rescale=1./255., validation_split=0.2)
+train_generator = datagen.flow_from_dataframe(dataframe=df,
+                                              directory=TRAIN_PATH,
+                                              x_col='ImageId',
+                                              y_col='EncodedPixels',
+                                              target_size=(W, H),
+                                              batch_size=TRAIN_BATCH,
+                                              class_mode='raw')
 
 #%%
-# Normalize Inputs
-print('Normalizing training data...\n')
-mean = np.mean(X_train, axis=0)
-std = np.std(X_train, axis=0)
-X_train = (X_train - mean)/std
-print('Done normalizing.\n')
+test_generator = datagen.flow_from_directory(directory=TEST_PATH,
+                                             target_size=(W, H),
+                                             class_mode=None,
+                                             batch_size=TEST_BATCH)
+
+print('Done.')
 
 #%% Define Model
 
@@ -99,7 +93,6 @@ p3 = MaxPooling2D((2, 2)) (c3)
 c4 = Conv2D(64, (3, 3), activation='relu', padding='same') (p3)
 c4 = Conv2D(64, (3, 3), activation='relu', padding='same') (c4)
 p4 = MaxPooling2D(pool_size=(2, 2)) (c4)
-
 
 c5 = Conv2D(128, (3, 3), activation='relu', padding='same') (p4)
 c5 = Conv2D(128, (3, 3), activation='relu', padding='same') (c5)
@@ -127,29 +120,32 @@ c9 = Conv2D(8, (3, 3), activation='relu', padding='same') (c9)
 outputs = Conv2D(1, (1, 1), activation='sigmoid')(c9)
 
 model = tf.keras.Model(inputs=[inputs], outputs=[outputs])
-model.compile(optimizer='adam', loss='binary_crossentropy', metrics=[tf.keras.metrics.PrecisionAtRecall(0.9)])
+model.compile(optimizer='adam', 
+              loss='binary_crossentropy', 
+              metrics=['Accuracy'])
 
 model.summary()
 
 #%% Save checkpoints
-CHECKPOINT_PATH = 'Unet_model_weights.h5'
-callbacks = [
-    ModelCheckpoint(CHECKPOINT_PATH, verbose=1, save_best_only=True),
-    EarlyStopping(patience=2, monitor='val_loss'),
-    TensorBoard(log_dir='logs')]
+callbacks = [ModelCheckpoint(CHECKPOINT_PATH,verbose=1,save_best_only=True),
+             EarlyStopping(patience=2,monitor='val_loss'),
+             TensorBoard(log_dir='logs')]
 
-#%% Build Model
-results = model.fit(X_train, Y_train, validation_split=0.1, batch_size = 16, epochs=15, callbacks=callbacks)
-
-#%% Save Model
+#%% Train model
+results = model.fit(decodeGenerator(train_generator,[TRAIN_BATCH, W, H]),
+                   steps_per_epoch=STEP_SIZE_TRAIN,
+                   epochs=EPOCHS)
 model.save(CHECKPOINT_PATH)
+model.load_weights(CHECKPOINT_PATH)
 
 #%% Predict
-Y_test_pred = model.predict(X_test)
+test_generator.reset()
+Y_test_pred = model.predict(test_generator, steps=STEP_SIZE_TEST)
 
 #%% Plot Results
+test_generator.reset()
 fig, m_axs = plt.subplots(10, 2, figsize=(10, 40))
 for n, (ax1, ax2) in enumerate(m_axs):
-    ax1.imshow(X_test[n])
+    ax1.imshow(np.squeeze(next(test_generator)))
     ax2.imshow(np.squeeze(Y_test_pred[n]))
     
